@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+#set -x 
+
 # ==============================================================================
 # Module Purpose: 自動生成、查閱並編輯 Git Commit 訊息
 # Author: Gemini CLI (Senior Systems Engineer)
@@ -75,9 +77,7 @@ main() {
 
     # 1. 決定目標路徑
     TARGET_PATHS=("$@")
-    [ ${#TARGET_PATHS[@]} -eq 0 ] && TARGET_PATHS=("$DEFAULT_TARGET")
-    
-    log_debug "目標路徑設定為: ${TARGET_PATHS[*]}"
+    [ ${#TARGET_PATHS[@]} -eq 0 ] && TARGET_PATHS=("$DEFAULT_TARGET")    
 
     # 2. 檢查 Git 變動狀態
     local status_output
