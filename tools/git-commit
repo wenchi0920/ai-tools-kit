@@ -1,29 +1,135 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Stage all changes
-#git add .
+# ==============================================================================
+# Module Purpose: 自動生成、查閱並編輯 Git Commit 訊息
+# Author: Gemini CLI (Senior Systems Engineer)
+# License: MIT
+# Changelog:
+# 2026-03-03: v1.2 - 優化編輯器體驗，加入 Diff 內容作為參考，完善路徑處理。
+# 2026-03-03: v1.1 - 新增指定路徑、Help 功能及 Debug 模式。
+# ==============================================================================
 
-# List staged files
-#added_files=$(git diff --cached --name-only)
-added_files=$(git diff .)
-if [ -z "$added_files" ]; then
-  echo "⚠️ No changes to commit. Aborting."
-  exit 1
-fi
+# --- 環境檢查 ---
+readonly DEPENDENCIES=("git" "gemini")
+for cmd in "${DEPENDENCIES[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "[ERROR] 缺少必要指令: $cmd" >&2
+        exit 1
+    fi
+done
 
-echo "📄 Files staged for commit:"
-echo "$added_files"
+# --- 常量與全域變數 ---
+readonly DEFAULT_TARGET="."
+DEBUG_MODE=false
+TARGET_PATHS=()
 
-# Generate commit message using Gemini
-#commit_msg=$(git diff --cached | gemini --model gemini-2.5-flash --prompt "Generate a concise commit message:")
-commit_msg=$(git diff . | gemini --model gemini-2.5-flash --prompt "使用 繁體中文 Generate a concise commit message:")
+# --- 日誌函式 ---
+log_info() { echo -e "[$(date +'%Y-%m-%dT%H:%M:%S')] [INFO] $*"; }
+log_debug() { [ "$DEBUG_MODE" = true ] && echo -e "[$(date +'%Y-%m-%dT%H:%M:%S')] [DEBUG] $*" >&2; }
+log_error() { echo -e "[$(date +'%Y-%m-%dT%H:%M:%S')] [ERROR] $*" >&2; }
 
-# Check if commit message is empty
-if [ -z "$commit_msg" ]; then
-  echo "❌ Commit message is empty. Aborting commit."
-  exit 1
-fi
+# --- 使用說明 ---
+usage() {
+    cat <<EOF
+用法: $(basename "$0") [選項] [--] [路徑...]
 
-# Commit with the generated message
-git commit -m "$commit_msg" .
+自動使用 Gemini 生成 Git commit 訊息，並允許手動編輯。
 
+選項:
+  -v          開啟偵錯模式 (Debug mode)
+  -h          顯示此幫助訊息
+
+範例:
+  $(basename "$0")                    # 對當前目錄執行
+  $(basename "$0") src/               # 只針對 src 目錄
+  $(basename "$0") file1.py file2.py  # 針對多個檔案
+  $(basename "$0") -v .               # 偵錯模式執行
+EOF
+    exit 0
+}
+
+# --- 清理機制 ---
+cleanup() {
+    if [[ -n "${TEMP_COMMIT_FILE:-}" && -f "$TEMP_COMMIT_FILE" ]]; then
+        log_debug "正在清除暫存檔: $TEMP_COMMIT_FILE"
+        rm -f "$TEMP_COMMIT_FILE"
+    fi
+}
+trap cleanup EXIT SIGINT SIGTERM
+
+# --- 核心邏輯 ---
+main() {
+    while getopts "vh" opt; do
+        case "$opt" in
+            v) DEBUG_MODE=true ;;
+            h) usage ;;
+            *) usage ;;
+        esac
+    done
+    shift $((OPTIND -1))
+
+    # 1. 決定目標路徑 (單檔/多檔/目錄)
+    TARGET_PATHS=("$@")
+    [ ${#TARGET_PATHS[@]} -eq 0 ] && TARGET_PATHS=("$DEFAULT_TARGET")
+    
+    log_debug "處理目標: ${TARGET_PATHS[*]}"
+
+    # 2. 檢查變動狀態
+    local status_output
+    status_output=$(git status --porcelain "${TARGET_PATHS[@]}")
+    if [ -z "$status_output" ]; then
+        log_error "⚠️  指定路徑下無任何變動。中止操作。"
+        exit 1
+    fi
+
+    echo "📄 偵測到變動的檔案:"
+    echo "$status_output"
+
+    # 3. 生成 Commit 訊息 (包含 staged 與 unstaged 內容)
+    log_info "正在透過 Gemini 分析 Diff 並生成訊息..."
+    local generated_msg
+    generated_msg=$(git diff HEAD "${TARGET_PATHS[@]}" | gemini --model gemini-2.5-flash --prompt "使用繁體中文，針對以下 diff 生成精簡且專業的 commit message。只需回傳訊息內容本身，不要包含引號。")
+
+    if [ -z "$generated_msg" ]; then
+        log_error "❌ 無法從 Gemini 取得內容。"
+        exit 1
+    fi
+
+    # 4. 提供查閱與編輯 (將 Diff 內容放入註釋供參考)
+    TEMP_COMMIT_FILE=$(mktemp)
+    cat <<EOF > "$TEMP_COMMIT_FILE"
+$generated_msg
+
+# ------------------------------------------------------------------------------
+# 正在為以下變動進行 Commit:
+$(echo "$status_output" | sed 's/^/# /')
+#
+# 您可以在上方編輯訊息。以 '#' 開頭的行將被忽略。
+# ------------------------------------------------------------------------------
+$(git diff HEAD "${TARGET_PATHS[@]}" | sed 's/^/# /')
+EOF
+
+    log_info "調用編輯器進行查閱與編輯..."
+    ${EDITOR:-vi} "$TEMP_COMMIT_FILE"
+
+    # 5. 過濾註釋並確認訊息
+    local final_msg
+    final_msg=$(grep -v '^#' "$TEMP_COMMIT_FILE" | sed '/^[[:space:]]*$/d' || true)
+
+    if [ -z "$final_msg" ]; then
+        log_error "❌ Commit 訊息為空。已取消。"
+        exit 1
+    fi
+
+    # 6. 執行 Commit (自動 stage 指定的路徑)
+    log_info "執行 Git Commit..."
+    if git commit -m "$final_msg" "${TARGET_PATHS[@]}"; then
+        log_info "✅ Commit 成功！"
+    else
+        log_error "❌ Git 執行失敗。"
+        exit 1
+    fi
+}
+
+main "$@"
