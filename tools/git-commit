@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+
+# ==============================================================================
+# Module Purpose: 自動生成 Git Commit 訊息工具 (Gemini-Powered)
+# Author: Senior Systems Engineer
+# License: MIT
+# Changelog:
+#   - 2026-03-03: Initial refactor to production-ready standards.
+#     * Added set -euo pipefail for strict execution.
+#     * Implemented trap for robust temporary file cleanup.
+#     * Added environment dependency checks.
+#     * Structured code with main() and local variables.
+#     * Improved logging with timestamps and PID.
+# ==============================================================================
+
+set -euo pipefail
+
+set -x 
+
+# --- Constants & Global Variables ---
+readonly PROGNAME=$(basename "$0")
+readonly TEMP_DIR="/tmp"
+readonly MODEL_NAME="gemini-2.0-flash" # 使用穩定版本
+readonly PROMPT_TEMPLATE="請根據以下 git diff 內容，使用「繁體中文」生成一個簡潔且專業的 git commit 訊息。內容應包含標題，必要時加入簡短的描述（Body）。"
+
+# --- Logging Functions ---
+log_info() {
+    echo -e "[$(date +'%Y-%m-%d %H:%M:%S')] [INFO] [$$] $*"
+}
+
+log_error() {
+    echo -e "[$(date +'%Y-%m-%d %H:%M:%S')] [ERROR] [$$] $*" >&2
+}
+
+show_usage() {
+    cat << EOF
+用法: $PROGNAME [選項] [路徑...]
+
+自動化 Git Commit 訊息生成工具 (基於 Gemini AI)。
+本工具會分析指定的 Git 變更內容，並透過 Gemini 生成專業的繁體中文 Commit 訊息。
+
+選項:
+  -d, --dry-run    僅生成並顯示 Commit 訊息，不執行實際的提交 (Commit) 作業。
+  -h, --help       顯示此詳細幫助訊息並退出。
+
+路徑:
+  [路徑...]        選填。指定要分析並提交的檔案或目錄路徑。
+                   若未指定，預設為當前目錄 (".")。
+
+結束代碼 (Exit Codes):
+  0                執行成功，或在 Dry-run 模式下正常結束。
+  1                發生一般性錯誤 (如: 指令缺失、API 呼叫失敗、訊息為空)。
+
+範例:
+  1. 針對當前目錄的所有變更生成 commit:
+     $ $PROGNAME
+
+  2. 僅針對 src/ 目錄的變更生成 commit 並進行測試 (不提交):
+     $ $PROGNAME --dry-run src/
+
+  3. 針對特定檔案生成 commit:
+     $ $PROGNAME path/to/file.py
+
+環境變數:
+  VISUAL, EDITOR   指定編輯器以調整生成的訊息 (預設為 vi)。
+  MODEL_NAME       內部使用的 Gemini 模型名稱 (目前: $MODEL_NAME)。
+
+EOF
+}
+
+# --- Helper Functions ---
+check_dependencies() {
+    local deps=("git" "gemini" "mktemp")
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            log_error "缺少必要指令: $cmd。請先安裝或設定 PATH。"
+            exit 1
+        fi
+    done
+}
+
+cleanup() {
+    if [[ -n "${TEMP_MSG_FILE:-}" && -f "$TEMP_MSG_FILE" ]]; then
+        log_info "正在清理暫存檔: $TEMP_MSG_FILE"
+        rm -f "$TEMP_MSG_FILE"
+    fi
+}
+
+# 捕捉中斷與結束信號
+trap cleanup EXIT SIGINT SIGTERM
+
+# --- Main Logic ---
+main() {
+    local dry_run=false
+    local paths=()
+    local temp_msg_file=""
+    local diff_content=""
+    local commit_msg=""
+    local editor=""
+
+    # 解析參數
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--dry-run)
+                dry_run=true
+                shift
+                ;;
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            *)
+                # 處理可能的未知參數或路徑
+                if [[ "$1" =~ ^- ]]; then
+                    log_error "未知選項: $1"
+                    show_usage
+                    exit 1
+                fi
+                paths+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # 初始化環境檢查
+    check_dependencies
+
+    # 如果沒有指定路徑，預設為當前目錄
+    if [[ ${#paths[@]} -eq 0 ]]; then
+        paths=(".")
+    fi
+
+    # 取得 git diff 內容 (含已 add 與未 add 的變更)
+    log_info "正在讀取變更內容: ${paths[*]}"
+    # 這裡組合 staged 與 non-staged 的差異，確保 AI 有足夠資訊
+    diff_content=$(git diff HEAD "${paths[@]}" 2>/dev/null || git diff "${paths[@]}")
+
+    if [[ -z "$diff_content" ]]; then
+        log_error "沒有偵測到任何變更。請確認指定的路徑是否有未提交的修改。"
+        exit 0
+    fi
+
+    log_info "正在請求 Gemini 生成 Commit 訊息 (Model: $MODEL_NAME)..."
+    
+    # 呼叫 Gemini API
+    commit_msg=$(echo "$diff_content" | gemini --model "$MODEL_NAME" --prompt "$PROMPT_TEMPLATE" 2>/dev/null || true)
+
+    if [[ -z "$commit_msg" ]]; then
+        log_error "無法從 Gemini 取得訊息。請檢查網路連線或 API 金鑰設定。"
+        exit 1
+    fi
+
+    # Dry-run 模式處理
+    if [[ "$dry_run" == true ]]; then
+        echo -e "\n--- [Dry-run] 生成的 Commit 訊息 ---"
+        echo "$commit_msg"
+        echo -e "-----------------------------------\n"
+        log_info "已啟動 Dry-run 模式，終止實際提交作業。"
+        exit 0
+    fi
+
+    # 建立暫存檔供編輯
+    TEMP_MSG_FILE=$(mktemp "$TEMP_DIR/git-commit-msg.XXXXXX")
+    echo "$commit_msg" > "$TEMP_MSG_FILE"
+
+    # 決定編輯器
+    editor="${VISUAL:-${EDITOR:-vi}}"
+    log_info "開啟編輯器: $editor"
+    
+    # 執行編輯器 (需要標準輸入輸出)
+    $editor "$TEMP_MSG_FILE"
+
+    # 檢查編輯後的文件是否為空
+    if [[ ! -s "$TEMP_MSG_FILE" ]]; then
+        log_error "Commit 訊息為空，已取消提交。"
+        exit 1
+    fi
+
+    # 執行實際 Commit
+    log_info "正在提交變更至 Git 倉庫..."
+    if git commit -F "$TEMP_MSG_FILE" "${paths[@]}"; then
+        log_info "提交成功！"
+    else
+        log_error "Git Commit 失敗，請檢查 Git 狀態。"
+        exit 1
+    fi
+}
+
+# 進入點
+main "$@"
