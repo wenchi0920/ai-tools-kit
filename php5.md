@@ -56,6 +56,8 @@ PHP 檔案必須具備以下結構：
 5. **Business Logic** (嚴格區分 Constructor Injection 與 Method Logic)
 6. **Execution Logic** (若為單一腳本，請封裝至類別並在最末端實例化執行)
 7. **版本紀錄** 每次只新增 不刪除或異動舊的紀錄, 嚴禁刪除舊的版本紀錄
+8. **程式語法** 
+- 不支援 $x = $a ?? ''; 能用 $x= $a ? $a : '';
 
 ## 5. 特定技術棧上下文 (Context)
 - **環境**：PHP 5.3。
