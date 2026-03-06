@@ -1,35 +1,49 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-#set -x 
-
 # ==============================================================================
-# Module Purpose: 自動生成、查閱並編輯 Git Commit 訊息
+# Module Purpose: 自動生成 Commit 訊息、加入 AI 簽名並支援自動 Push (v1.4)
 # Author: Gemini CLI (Senior Systems Engineer)
 # License: MIT
 # Changelog:
-# 2026-03-03: v1.1 - 新增指定路徑、Help 功能、Debug 模式及編輯器整合。
+# 2026-03-03: v1.1 - 初始版本：支援多路徑與偵錯模式。
+# 2026-03-06: v1.4 - 整合圖片需求：AI 簽名、自動 Push 與詳細變動報表。
 # ==============================================================================
 
 # --- 環境檢查 ---
-readonly DEPENDENCIES=("git" "gemini")
+readonly DEPENDENCIES=("git" "gemini" "grep" "sed")
 for cmd in "${DEPENDENCIES[@]}"; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo -e "[ERROR] 缺少必要指令: $cmd" >&2
+        echo -e "[\033[0;31mERROR\033[0m] 缺少必要指令: $cmd" >&2
         exit 1
     fi
 done
 
 # --- 常量與全域變數 ---
 readonly DEFAULT_TARGET="."
+readonly DEFAULT_CO_AUTHOR="Gemini CLI <noreply@google.com>"
+
 DEBUG_MODE=false
+PUSH_AFTER_COMMIT=false
 TARGET_PATHS=()
 TEMP_COMMIT_FILE=""
 
-# --- 日誌函式 ---
-log_info() { echo -e "[\033[0;32mINFO\033[0m] $*"; }
-log_debug() { [ "$DEBUG_MODE" = true ] && echo -e "[\033[0;34mDEBUG\033[0m] $*" >&2; }
-log_error() { echo -e "[\033[0;31mERROR\033[0m] $*" >&2; }
+# --- 日誌與色彩 ---
+log_info()  { echo -e "[\033[0;32mINFO\033[0m] [\033[0;36m$(date +'%H:%M:%S')\033[0m] $*"; }
+log_debug() { [ "$DEBUG_MODE" = true ] && echo -e "[\033[0;34mDEBUG\033[0m] [\033[0;36m$(date +'%H:%M:%S')\033[0m] $*" >&2; }
+log_error() { echo -e "[\033[0;31mERROR\033[0m] [\033[0;36m$(date +'%H:%M:%S')\033[0m] $*" >&2; }
+bold_text() { echo -en "\033[1m$*\033[0m"; }
+
+# --- 清理機制 ---
+cleanup() {
+    local exit_code=$?
+    if [[ -n "${TEMP_COMMIT_FILE:-}" && -f "$TEMP_COMMIT_FILE" ]]; then
+        log_debug "正在移除暫存檔: $TEMP_COMMIT_FILE"
+        rm -f "$TEMP_COMMIT_FILE"
+    fi
+    exit "$exit_code"
+}
+trap cleanup EXIT SIGINT SIGTERM
 
 # --- 使用說明 ---
 usage() {
@@ -39,35 +53,25 @@ usage() {
 自動使用 Gemini 分析 Git Diff 並生成專業的 commit 訊息，提供手動編輯功能。
 
 選項:
-  -v          開啟偵錯模式 (Debug mode)，顯示詳細執行過程
+  -p          提交成功後自動執行 git push
+  -v          開啟偵錯模式 (Debug mode)
   -h          顯示此幫助訊息
 
 參數:
-  [路徑...]   指定要分析變動的檔案或目錄。支援多個路徑。
+  [路徑...]   指定要分析變動的檔案或目錄。
               若未提供，預設為當前目錄 (.)。
 
 範例:
-  $(basename "$0")                    # 對當前目錄執行
-  $(basename "$0") src/               # 只針對 src 目錄進行分析
-  $(basename "$0") file1.py file2.py  # 針對多個特定檔案
-  $(basename "$0") -v .               # 以偵錯模式對當前目錄執行
+  $(basename "$0") -p src/   # 提交 src 目錄變動並 Push
 EOF
     exit 0
 }
 
-# --- 清理機制 ---
-cleanup() {
-    if [[ -n "${TEMP_COMMIT_FILE:-}" && -f "$TEMP_COMMIT_FILE" ]]; then
-        log_debug "正在移除暫存檔: $TEMP_COMMIT_FILE"
-        rm -f "$TEMP_COMMIT_FILE"
-    fi
-}
-trap cleanup EXIT SIGINT SIGTERM
-
 # --- 核心邏輯 ---
 main() {
-    while getopts "vh" opt; do
+    while getopts "pvh" opt; do
         case "$opt" in
+            p) PUSH_AFTER_COMMIT=true ;;
             v) DEBUG_MODE=true ;;
             h) usage ;;
             *) usage ;;
@@ -75,11 +79,17 @@ main() {
     done
     shift $((OPTIND -1))
 
-    # 1. 決定目標路徑
+    # 1. 檢查是否在 Git 倉庫內
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        log_error "當前目錄或其父目錄不是 Git 倉庫。"
+        exit 1
+    fi
+
+    # 2. 決定目標路徑
     TARGET_PATHS=("$@")
     [ ${#TARGET_PATHS[@]} -eq 0 ] && TARGET_PATHS=("$DEFAULT_TARGET")    
 
-    # 2. 檢查 Git 變動狀態
+    # 3. 檢查 Git 變動狀態
     local status_output
     status_output=$(git status --porcelain "${TARGET_PATHS[@]}" 2>/dev/null || true)
     if [ -z "$status_output" ]; then
@@ -87,44 +97,46 @@ main() {
         exit 1
     fi
 
-    echo -e "\n📄 \033[1m偵測到變動的檔案:\033[0m"
+    echo -e "\n📄 $(bold_text "本次偵測到之變更檔案:")"
     echo "$status_output"
     echo ""
 
-    # 3. 生成 Commit 訊息
+    # 4. 生成 Commit 訊息
     log_info "正在透過 Gemini 分析變動並生成訊息..."
     
-    # 取得 Diff 內容 (包含 HEAD 之後的所有變動)
     local diff_content
+    # 優先取得包含 staged 與 unstaged 的完整變動
     diff_content=$(git diff HEAD "${TARGET_PATHS[@]}" 2>/dev/null || true)
     
-    # 如果 staged 但沒有 diff，則取 --cached
     if [ -z "$diff_content" ]; then
+        # 處理初始 commit 或僅有新檔案的情境
         diff_content=$(git diff --cached "${TARGET_PATHS[@]}" 2>/dev/null || true)
     fi
 
     if [ -z "$diff_content" ]; then
-        log_error "無法取得 Diff 內容，請確認檔案是否有實際內容變動。"
+        log_error "無法取得 Diff 內容，請確認檔案是否有內容變動。"
         exit 1
     fi
 
     local generated_msg
-    generated_msg=$(echo "$diff_content" | gemini --model gemini-2.5-flash --prompt "你是一位專業的 Staff Engineer。請針對以下 Git Diff 內容，產生一個符合 'Conventional Commits' 規範的繁體中文 Commit Message。只需回傳訊息內容本身，不需引號或額外解釋。" 2>/dev/null || true)
+    generated_msg=$(echo "$diff_content" | gemini --model gemini-2.5-flash --prompt "你是一位專業的 Staff Engineer。請針對以下 Git Diff 內容，產生一個符合 'Conventional Commits' 規範的繁體中文 Commit Message。只需回傳訊息內容本身（包含標題與必要的 Body），不需引號或額外解釋。" 2>/dev/null || true)
 
     if [ -z "$generated_msg" ]; then
         log_error "Gemini 生成內容失敗。將改用空白模板。"
-        generated_msg="feat: [請輸入 commit 標題]"
+        generated_msg="feat: [請輸入 commit 標題]\n\n[請輸入詳細說明]"
     fi
 
-    # 4. 準備編輯界面
+    # 5. 準備編輯界面與加入簽名
     TEMP_COMMIT_FILE=$(mktemp)
     cat <<EOF > "$TEMP_COMMIT_FILE"
-$generated_msg
+$(echo -e "$generated_msg")
+
+Co-Authored-By: $DEFAULT_CO_AUTHOR
 
 # ------------------------------------------------------------------------------
 # [Git Commit 訊息編輯器]
 # 指示：
-# 1. 在上方編輯您的 Commit 訊息內容。
+# 1. 在上方編輯您的 Commit 訊息內容。標題與正文間請保留一空行。
 # 2. 以 '#' 開頭的行將在提交時被自動忽略。
 # 3. 若訊息內容為空，將取消本次提交。
 #
@@ -132,34 +144,50 @@ $generated_msg
 $(echo "$status_output" | sed 's/^/# /')
 #
 # 詳細變動內容 (Diff):
-$(echo "$diff_content" | sed 's/^/# /')
+$(echo "$diff_content" | sed 's/^/# /' | head -n 100)
+# (Diff 內容過長時僅顯示前 100 行)
 # ------------------------------------------------------------------------------
 EOF
 
-    # 5. 調用編輯器
-    log_info "開啟編輯器進行查閱與編輯..."
+    # 6. 調用編輯器
+    log_info "開啟編輯器進行查閱與編輯 (Editor: ${EDITOR:-vi})..."
     ${EDITOR:-vi} "$TEMP_COMMIT_FILE"
 
-    # 6. 過濾訊息並檢查
-    local final_msg
-    final_msg=$(grep -v '^#' "$TEMP_COMMIT_FILE" | sed '/^[[:space:]]*$/d' || true)
-
-    if [ -z "$final_msg" ]; then
+    # 7. 執行提交
+    log_info "執行 Git Add & Commit..."
+    
+    # 先將指定路徑加入索引 (Stage)
+    git add "${TARGET_PATHS[@]}"
+    
+    # 檢查清理後的訊息是否為空 (排除註解行)
+    if ! grep -v '^#' "$TEMP_COMMIT_FILE" | grep -q '[^[:space:]]'; then
         log_error "Commit 訊息為空，操作已取消。"
         exit 1
     fi
 
-    # 7. 執行提交
-    log_info "執行 Git Commit..."
-    # 先將指定路徑加入索引 (Stage)
-    git add "${TARGET_PATHS[@]}"
-    
-    if git commit -m "$final_msg"; then
-        echo -e "\n✅ \033[0;32mCommit 成功！\033[0m"
+    # 使用 git commit -F 會自動處理以 # 開頭的註解行
+    if git commit -F "$TEMP_COMMIT_FILE"; then
+        echo -e "\n✅ $(bold_text "\033[0;32mCommit 成功！\033[0m")"
     else
         log_error "Git Commit 失敗，請檢查 Git 狀態。"
         exit 1
     fi
+
+    # 8. 執行自動 Push
+    if [ "$PUSH_AFTER_COMMIT" = true ]; then
+        log_info "正在執行 git push..."
+        if git push; then
+            echo -e "🚀 $(bold_text "\033[0;32mPush 成功！\033[0m")"
+        else
+            log_error "Push 失敗，請手動檢查遠端狀態。"
+            exit 1
+        fi
+    fi
+
+    # 9. 回報變動清單
+    echo -e "\n📦 $(bold_text "本次提交包含之檔案清單:")"
+    git diff-tree --no-commit-id --name-only -r HEAD | sed 's/^/  - /'
+    echo ""
 }
 
 main "$@"
