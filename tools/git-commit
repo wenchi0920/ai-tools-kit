@@ -2,13 +2,13 @@
 set -euo pipefail
 
 # ==============================================================================
-# Module Purpose: 自動生成 Commit 訊息並支援自動 Push (v2.0)
+# Module Purpose: 自動生成 Commit 訊息並支援自動 Push (v2.1)
 # Author: Gemini CLI (Senior Systems Engineer)
 # License: MIT
 # Changelog:
 # 2026-03-03: v1.1 - 初始版本。
-# 2026-03-06: v1.9 - 調整流程：先 Add 再分析，支援所有狀態之檔案。
-# 2026-03-09: v2.0 - 支援引數、管道 (STDIN) 混合輸入，強化路徑驗證與容錯。
+# 2026-03-09: v2.0 - 支援引數與管道 (STDIN) 輸入。
+# 2026-03-09: v2.1 - 強化路徑清理 (Trim)，支援 git status 衍生之複雜格式。
 # ==============================================================================
 
 # --- 環境檢查 ---
@@ -53,73 +53,74 @@ main() {
 
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { log_error "非 Git 倉庫。"; exit 1; }
 
-    # 1. 支援 STDIN 讀取路徑 (例如: find . -name "*.php" | ./git-commit)
+    # 1. 處理 STDIN (管道) 輸入
     if [[ ! -t 0 ]]; then
-        log_info "從 STDIN (管道) 讀取路徑清單..."
+        log_info "從 STDIN (管道) 讀取並清理路徑..."
         while IFS= read -r line; do
-            [[ -n "$line" ]] && TARGET_PATHS+=("$line")
+            # 清理邏輯：去首尾空白，並試圖移除 ':' 及其前面的狀態字元
+            local clean_p
+            clean_p=$(echo "$line" | sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e 's/^.*:[[:space:]]*//')
+            [[ -n "$clean_p" ]] && TARGET_PATHS+=("$clean_p")
         done
     fi
 
-    # 2. 加入命令列引數
+    # 2. 處理引數輸入
     for arg in "$@"; do
-        [[ -n "$arg" ]] && TARGET_PATHS+=("$arg")
+        local clean_arg
+        clean_arg=$(echo "$arg" | sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//')
+        [[ -n "$clean_arg" ]] && TARGET_PATHS+=("$clean_arg")
     done
 
     # 3. 加入指定目錄
     [[ -n "$TARGET_DIR" ]] && TARGET_PATHS+=("$TARGET_DIR")
 
-    # 4. 路徑校驗與預設行為
+    # 4. 路徑校驗
     if [[ ${#TARGET_PATHS[@]} -eq 0 ]]; then
-        # 完全沒傳參數 -> 預設 "."
         TARGET_PATHS=(".")
     else
-        # 有傳參數 -> 過濾出存在的路徑，防止 git add 失敗
         local valid_paths=()
         for p in "${TARGET_PATHS[@]}"; do
+            # 支援包含通配符的處理，或單純存在性檢查
             if [[ -e "$p" ]]; then
                 valid_paths+=("$p")
             else
-                log_debug "忽略不存在的路徑: $p"
+                log_debug "忽略無效路徑: '$p'"
             fi
         done
         
         if [[ ${#valid_paths[@]} -eq 0 ]]; then
-            log_error "傳入的所有路徑皆不存在。"; exit 1
+            log_error "所有傳入路徑均無效或不存在。"; exit 1
         fi
         TARGET_PATHS=("${valid_paths[@]}")
     fi
 
-    # 5. 執行 Stage (add)
+    # 5. 執行 Stage
     log_info "執行 Git Stage (add)..."
     git add "${TARGET_PATHS[@]}"
 
-    # 6. 獲取變動狀態
+    # 6. 狀態檢查
     local status_output
     status_output=$(git status --porcelain "${TARGET_PATHS[@]}" 2>/dev/null || true)
     if [ -z "$status_output" ]; then
-        log_error "指定路徑下偵測不到變動。"; exit 1
+        log_error "指定範圍內無變動。"; exit 1
     fi
 
-    echo -e "\n📄 $(bold_text "已加入 Stage 之變更檔案:")"
+    echo -e "\n📄 $(bold_text "待提交變更:")"
     echo "$status_output"
 
-    # 7. 生成 Commit 訊息
-    log_info "分析變動並生成訊息中..."
+    # 7. 分析與生成訊息
+    log_info "分析中..."
     local diff_content
     diff_content=$(git diff --cached "${TARGET_PATHS[@]}" 2>/dev/null || true)
-
-    if [ -z "$diff_content" ]; then
-        diff_content="[檔案狀態清單]\n$status_output"
-    fi
+    [[ -z "$diff_content" ]] && diff_content="[Files]\n$status_output"
 
     local generated_msg
-    generated_msg=$(echo "$diff_content" | gemini --model gemini-2.5-flash --prompt "你是一位專業的 Staff Engineer。請針對以下 Git Diff 內容，產生一個符合 'Conventional Commits' 規範的繁體中文 Commit Message。只需回傳訊息本身。")
+    generated_msg=$(echo "$diff_content" | gemini --model gemini-2.5-flash --prompt "你是一位專業 Staff Engineer。請根據 Diff 產生符合 Conventional Commits 規範的繁體中文 Commit Message。")
 
-    # 8. 準備訊息檔
+    # 8. Commit
     TEMP_COMMIT_FILE=$(mktemp)
     cat <<EOF > "$TEMP_COMMIT_FILE"
-${generated_msg:-feat: 更新內容}
+${generated_msg:-feat: 自動提交內容}
 
 Co-Authored-By: $DEFAULT_CO_AUTHOR
 
@@ -129,32 +130,27 @@ $(echo "$status_output" | sed 's/^/# /')
 # ------------------------------------------------------------------------------
 EOF
 
-    # 9. 編輯器
-    log_info "開啟編輯器 (Editor: ${EDITOR:-vi})..."
+    log_info "開啟編輯器..."
     ${EDITOR:-vi} "$TEMP_COMMIT_FILE"
 
-    # 10. Commit
-    log_info "執行 Git Commit..."
     if ! grep -v '^#' "$TEMP_COMMIT_FILE" | grep -q '[^[:space:]]'; then
-        log_error "訊息為空，已取消。"; exit 1
+        log_error "訊息為空。"; exit 1
     fi
 
     if git commit -F "$TEMP_COMMIT_FILE"; then
-        echo -e "\n✅ $(bold_text "\033[0;32mCommit 成功！\033[0m")"
+        echo -e "\n✅ Commit 成功！"
     else
         log_error "Commit 失敗。"; exit 1
     fi
 
-    # 11. Push
+    # 9. Push
     if [ "$PUSH_AFTER_COMMIT" = true ]; then
-        log_info "正在執行 git push..."
-        git push && echo -e "🚀 $(bold_text "\033[0;32mPush 成功！\033[0m")" || { log_error "Push 失敗。"; exit 1; }
+        git push && echo -e "🚀 Push 成功！"
     fi
 
-    # 12. 報表
-    echo -e "\n📦 $(bold_text "本次提交明細:")"
+    # 10. 報表
+    echo -e "\n📦 提交明細:"
     git diff-tree --no-commit-id --name-only -r HEAD | sed 's/^/  - /'
-    echo ""
 }
 
 main "$@"
