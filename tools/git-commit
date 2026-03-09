@@ -2,12 +2,13 @@
 set -euo pipefail
 
 # ==============================================================================
-# Module Purpose: 自動生成 Commit 訊息並支援自動 Push (v1.9)
+# Module Purpose: 自動生成 Commit 訊息並支援自動 Push (v2.0)
 # Author: Gemini CLI (Senior Systems Engineer)
 # License: MIT
 # Changelog:
 # 2026-03-03: v1.1 - 初始版本。
 # 2026-03-06: v1.9 - 調整流程：先 Add 再分析，支援所有狀態之檔案。
+# 2026-03-09: v2.0 - 支援引數、管道 (STDIN) 混合輸入，強化路徑驗證與容錯。
 # ==============================================================================
 
 # --- 環境檢查 ---
@@ -52,16 +53,48 @@ main() {
 
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { log_error "非 Git 倉庫。"; exit 1; }
 
-    # 1. 路徑處理
-    TARGET_PATHS=("$@")
-    [[ -n "$TARGET_DIR" ]] && TARGET_PATHS+=("$TARGET_DIR")
-    [[ ${#TARGET_PATHS[@]} -eq 0 ]] && TARGET_PATHS=(".")
+    # 1. 支援 STDIN 讀取路徑 (例如: find . -name "*.php" | ./git-commit)
+    if [[ ! -t 0 ]]; then
+        log_info "從 STDIN (管道) 讀取路徑清單..."
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && TARGET_PATHS+=("$line")
+        done
+    fi
 
-    # 2. 先進行 Stage (核心流程變更)
+    # 2. 加入命令列引數
+    for arg in "$@"; do
+        [[ -n "$arg" ]] && TARGET_PATHS+=("$arg")
+    done
+
+    # 3. 加入指定目錄
+    [[ -n "$TARGET_DIR" ]] && TARGET_PATHS+=("$TARGET_DIR")
+
+    # 4. 路徑校驗與預設行為
+    if [[ ${#TARGET_PATHS[@]} -eq 0 ]]; then
+        # 完全沒傳參數 -> 預設 "."
+        TARGET_PATHS=(".")
+    else
+        # 有傳參數 -> 過濾出存在的路徑，防止 git add 失敗
+        local valid_paths=()
+        for p in "${TARGET_PATHS[@]}"; do
+            if [[ -e "$p" ]]; then
+                valid_paths+=("$p")
+            else
+                log_debug "忽略不存在的路徑: $p"
+            fi
+        done
+        
+        if [[ ${#valid_paths[@]} -eq 0 ]]; then
+            log_error "傳入的所有路徑皆不存在。"; exit 1
+        fi
+        TARGET_PATHS=("${valid_paths[@]}")
+    fi
+
+    # 5. 執行 Stage (add)
     log_info "執行 Git Stage (add)..."
     git add "${TARGET_PATHS[@]}"
 
-    # 3. 獲取變動狀態
+    # 6. 獲取變動狀態
     local status_output
     status_output=$(git status --porcelain "${TARGET_PATHS[@]}" 2>/dev/null || true)
     if [ -z "$status_output" ]; then
@@ -71,21 +104,19 @@ main() {
     echo -e "\n📄 $(bold_text "已加入 Stage 之變更檔案:")"
     echo "$status_output"
 
-    # 4. 生成 Commit 訊息 (分析 Cached Diff)
+    # 7. 生成 Commit 訊息
     log_info "分析變動並生成訊息中..."
     local diff_content
     diff_content=$(git diff --cached "${TARGET_PATHS[@]}" 2>/dev/null || true)
 
     if [ -z "$diff_content" ]; then
-        # 如果依然無內容變動 (例如僅新增空目錄或空檔案)，改用檔案清單
-        log_debug "Cached Diff 為空，改用檔案狀態清單作為參考。"
         diff_content="[檔案狀態清單]\n$status_output"
     fi
 
     local generated_msg
     generated_msg=$(echo "$diff_content" | gemini --model gemini-2.5-flash --prompt "你是一位專業的 Staff Engineer。請針對以下 Git Diff 內容，產生一個符合 'Conventional Commits' 規範的繁體中文 Commit Message。只需回傳訊息本身。")
 
-    # 5. 準備訊息檔 (含簽名)
+    # 8. 準備訊息檔
     TEMP_COMMIT_FILE=$(mktemp)
     cat <<EOF > "$TEMP_COMMIT_FILE"
 ${generated_msg:-feat: 更新內容}
@@ -98,11 +129,11 @@ $(echo "$status_output" | sed 's/^/# /')
 # ------------------------------------------------------------------------------
 EOF
 
-    # 6. 編輯器
+    # 9. 編輯器
     log_info "開啟編輯器 (Editor: ${EDITOR:-vi})..."
     ${EDITOR:-vi} "$TEMP_COMMIT_FILE"
 
-    # 7. Commit
+    # 10. Commit
     log_info "執行 Git Commit..."
     if ! grep -v '^#' "$TEMP_COMMIT_FILE" | grep -q '[^[:space:]]'; then
         log_error "訊息為空，已取消。"; exit 1
@@ -111,16 +142,16 @@ EOF
     if git commit -F "$TEMP_COMMIT_FILE"; then
         echo -e "\n✅ $(bold_text "\033[0;32mCommit 成功！\033[0m")"
     else
-        log_error "Commit 失敗。請手動執行 git status 檢查狀態。"; exit 1
+        log_error "Commit 失敗。"; exit 1
     fi
 
-    # 8. Push
+    # 11. Push
     if [ "$PUSH_AFTER_COMMIT" = true ]; then
         log_info "正在執行 git push..."
         git push && echo -e "🚀 $(bold_text "\033[0;32mPush 成功！\033[0m")" || { log_error "Push 失敗。"; exit 1; }
     fi
 
-    # 9. 報表
+    # 12. 報表
     echo -e "\n📦 $(bold_text "本次提交明細:")"
     git diff-tree --no-commit-id --name-only -r HEAD | sed 's/^/  - /'
     echo ""
