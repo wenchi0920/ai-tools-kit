@@ -2,13 +2,14 @@
 set -euo pipefail
 
 # ==============================================================================
-# Module Purpose: 自動生成 Commit 訊息並支援自動 Push (v2.1)
+# Module Purpose: 自動生成 Commit 訊息並支援自動 Push (v2.2)
 # Author: Gemini CLI (Senior Systems Engineer)
 # License: MIT
 # Changelog:
 # 2026-03-03: v1.1 - 初始版本。
 # 2026-03-09: v2.0 - 支援引數與管道 (STDIN) 輸入。
 # 2026-03-09: v2.1 - 強化路徑清理 (Trim)，支援 git status 衍生之複雜格式。
+# 2026-03-19: v2.2 - 新增 --auto (-a) 支援，自動提交不開啟編輯器。
 # ==============================================================================
 
 # --- 環境檢查 ---
@@ -21,6 +22,7 @@ done
 readonly DEFAULT_CO_AUTHOR="Gemini CLI <noreply@google.com>"
 DEBUG_MODE=false
 PUSH_AFTER_COMMIT=false
+AUTO_COMMIT=false
 TARGET_DIR=""
 TARGET_PATHS=()
 TEMP_COMMIT_FILE=""
@@ -41,15 +43,22 @@ trap cleanup EXIT SIGINT SIGTERM
 
 # --- 核心邏輯 ---
 main() {
-    while getopts "pd:vh" opt; do
-        case "$opt" in
-            p) PUSH_AFTER_COMMIT=true ;;
-            d) TARGET_DIR="$OPTARG" ;;
-            v) DEBUG_MODE=true ;;
-            *) exit 1 ;;
+    # 解析參數
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p) PUSH_AFTER_COMMIT=true; shift ;;
+            -d) TARGET_DIR="$2"; shift 2 ;;
+            -v) DEBUG_MODE=true; shift ;;
+            -a|--auto) AUTO_COMMIT=true; shift ;;
+            -h|--help) 
+                echo "用法: $0 [-p] [-d 目錄] [-v] [-a|--auto] [路徑...]"
+                exit 0 
+                ;;
+            --) shift; break ;;
+            -*) log_error "未知選項: $1"; exit 1 ;;
+            *) break ;;
         esac
     done
-    shift $((OPTIND -1))
 
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { log_error "非 Git 倉庫。"; exit 1; }
 
@@ -80,7 +89,6 @@ main() {
     else
         local valid_paths=()
         for p in "${TARGET_PATHS[@]}"; do
-            # 支援包含通配符的處理，或單純存在性檢查
             if [[ -e "$p" ]]; then
                 valid_paths+=("$p")
             else
@@ -130,8 +138,12 @@ $(echo "$status_output" | sed 's/^/# /')
 # ------------------------------------------------------------------------------
 EOF
 
-    log_info "開啟編輯器..."
-    ${EDITOR:-vi} "$TEMP_COMMIT_FILE"
+    if [ "$AUTO_COMMIT" = false ]; then
+        log_info "開啟編輯器..."
+        ${EDITOR:-vi} "$TEMP_COMMIT_FILE"
+    else
+        log_info "自動模式：跳過預覽直接提交。"
+    fi
 
     if ! grep -v '^#' "$TEMP_COMMIT_FILE" | grep -q '[^[:space:]]'; then
         log_error "訊息為空。"; exit 1
