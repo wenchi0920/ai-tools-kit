@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ==============================================================================
-# Module Purpose: 自動生成 Commit 訊息並支援自動 Push (v2.2)
+# Module Purpose: 自動生成 Commit 訊息並支援自動 Push (v2.3)
 # Author: Gemini CLI (Senior Systems Engineer)
 # License: MIT
 # Changelog:
@@ -10,6 +10,7 @@ set -euo pipefail
 # 2026-03-09: v2.0 - 支援引數與管道 (STDIN) 輸入。
 # 2026-03-09: v2.1 - 強化路徑清理 (Trim)，支援 git status 衍生之複雜格式。
 # 2026-03-19: v2.2 - 新增 --auto (-a) 支援，自動提交不開啟編輯器。
+# 2026-03-20: v2.3 - 支援處理已刪除 (deleted) 的檔案路徑。
 # ==============================================================================
 
 # --- 環境檢查 ---
@@ -66,9 +67,16 @@ main() {
     if [[ ! -t 0 ]]; then
         log_info "從 STDIN (管道) 讀取並清理路徑..."
         while IFS= read -r line; do
-            # 清理邏輯：去首尾空白，並試圖移除 ':' 及其前面的狀態字元
+            # 清理邏輯：
+            # 1. 移除首尾空白
+            # 2. 如果是 git status --porcelain 格式 (e.g., "M  path/to/file") -> 移除前兩個字元及隨後的空白
+            # 3. 如果是帶冒號格式 (e.g., "modified:  path/to/file") -> 移除冒號及其前面內容
             local clean_p
-            clean_p=$(echo "$line" | sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e 's/^.*:[[:space:]]*//')
+            clean_p=$(echo "$line" | sed -E \
+                -e 's/^[[:space:]]+//' \
+                -e 's/[[:space:]]+$//' \
+                -e 's/^.{1,2}[[:space:]]+//' \
+                -e 's/^.*:[[:space:]]*//')
             [[ -n "$clean_p" ]] && TARGET_PATHS+=("$clean_p")
         done
     fi
@@ -83,16 +91,17 @@ main() {
     # 3. 加入指定目錄
     [[ -n "$TARGET_DIR" ]] && TARGET_PATHS+=("$TARGET_DIR")
 
-    # 4. 路徑校驗
+    # 4. 路徑校驗 (支援已刪除檔案)
     if [[ ${#TARGET_PATHS[@]} -eq 0 ]]; then
         TARGET_PATHS=(".")
     else
         local valid_paths=()
         for p in "${TARGET_PATHS[@]}"; do
-            if [[ -e "$p" ]]; then
+            # 條件：檔案存在於磁碟，或是 Git 已追蹤的檔案（包含已刪除但未 Staged 的檔案）
+            if [[ -e "$p" ]] || git ls-files --error-unmatch "$p" >/dev/null 2>&1; then
                 valid_paths+=("$p")
             else
-                log_debug "忽略無效路徑: '$p'"
+                log_debug "忽略無效路覽: '$p' (既不存在也不在 Git 索引中)"
             fi
         done
         
